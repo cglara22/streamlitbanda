@@ -64,18 +64,28 @@ NOTE_ICON: dict[str, str] = {
 }
 
 # Áreas de trabajo de la banda
-AREA_DEFAULT = "otro"
+AREA_DEFAULT = "direccion"
 AREAS: dict[str, str] = {
+    "direccion": "🧭 Dirección y Planificación",
+    "booking": "📞 Booking",
+    "rrss": "📣 RRSS / Marketing",
+    "diseno": "🎨 Diseño e imagen",
+    "foto_video": "📷 Fotografía y vídeo",
     "ensayo": "🎤 Ensayo",
     "bolo": "🎫 Bolo / Concierto",
-    "grabacion": "🎙️ Grabación",
-    "promo": "📣 Promo / Redes",
-    "booking": "📞 Booking",
-    "merch": "👕 Merch",
+    "distribucion": "💿 Distribución digital",
+    "prensa": "📰 Prensa y comunicación",
     "finanzas": "💶 Finanzas",
     "logistica": "🚐 Logística",
-    "otro": "📌 Otro",
+    "tecnico": "🔊 Equipo técnico",
+    "composicion": "🎼 Composición",
+    "merch": "👕 Merchandising",
 }
+
+# Tipos: tarea con flujo de estados, o evento con fecha (bolo, ensayo…)
+KIND_TASK = "task"
+KIND_EVENT = "event"
+KIND_LABEL: dict[str, str] = {KIND_TASK: "📌 Tarea", KIND_EVENT: "📅 Evento"}
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 MESES_ES = [
@@ -98,17 +108,73 @@ def esc(text: Any) -> str:
 
 
 # ─────────────────────────────────────────────
-#  DB helpers
+#  DB helpers — SQLite local o Postgres (Supabase) vía st.secrets["DB_URL"]
 # ─────────────────────────────────────────────
+def _get_db_url() -> Optional[str]:
+    try:
+        return st.secrets.get("DB_URL")
+    except Exception:
+        return None
+
+
+DB_URL = _get_db_url()
+USE_PG = bool(DB_URL)
+
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+
+
+def _pg_translate(sql: str) -> str:
+    """Traduce el SQL escrito para SQLite al dialecto de Postgres."""
+    sql = sql.replace("?", "%s")
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    sql = sql.replace("datetime('now')", "to_char(now(), 'YYYY-MM-DD HH24:MI:SS')")
+    sql = sql.replace("date('now')", "CURRENT_DATE")
+    sql = sql.replace("GROUP_CONCAT(DISTINCT u.name)", "STRING_AGG(DISTINCT u.name, ',')")
+    if sql.lstrip().upper().startswith("INSERT OR IGNORE"):
+        sql = sql.replace("INSERT OR IGNORE", "INSERT", 1).rstrip() + " ON CONFLICT DO NOTHING"
+    sql = re.sub(r"ADD COLUMN (?!IF NOT EXISTS)", "ADD COLUMN IF NOT EXISTS ", sql)
+    return sql
+
+
+class _PgConn:
+    """Envoltorio que imita la interfaz de sqlite3.Connection sobre psycopg2."""
+
+    def __init__(self, conn) -> None:
+        self._c = conn
+
+    def execute(self, sql: str, params=()):
+        cur = self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(_pg_translate(sql), params or None)
+        return cur
+
+    def cursor(self) -> "_PgConn":
+        return self
+
+    def commit(self) -> None:
+        self._c.commit()
+
+    def close(self) -> None:
+        self._c.close()
+
+
 @contextmanager
 def get_conn():
-    """Context manager que garantiza cierre de la conexión SQLite."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+    """Conexión a Postgres (Supabase) si hay DB_URL en secrets; si no, SQLite local."""
+    if USE_PG:
+        conn = psycopg2.connect(DB_URL)
+        try:
+            yield _PgConn(conn)
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 # ─────────────────────────────────────────────
@@ -270,13 +336,18 @@ def init_db_and_migrate() -> None:
             "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN closed_at TEXT",
             "ALTER TABLE users ADD COLUMN username TEXT",
-            "ALTER TABLE tasks ADD COLUMN area TEXT NOT NULL DEFAULT 'otro'",
+            "ALTER TABLE tasks ADD COLUMN area TEXT NOT NULL DEFAULT 'direccion'",
+            "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'",
         ]
         for migration in migrations:
             try:
                 cur.execute(migration)
             except sqlite3.OperationalError:
                 pass
+
+        # Remapear áreas antiguas al catálogo nuevo (idempotente)
+        for old, new in [("promo", "rrss"), ("grabacion", "composicion"), ("otro", "direccion")]:
+            cur.execute("UPDATE tasks SET area = ? WHERE area = ?", (new, old))
 
         try:
             cur.execute(
@@ -447,7 +518,7 @@ def fetch_tasks(filters: dict) -> list[sqlite3.Row]:
         SELECT
             t.*,
             GROUP_CONCAT(DISTINCT u.name) AS assignees,
-            COALESCE(nc.notes_count, 0) AS notes_count
+            COALESCE(MAX(nc.notes_count), 0) AS notes_count
         FROM tasks t {join_assignee}
         LEFT JOIN task_assignees ta ON ta.task_id = t.id
         LEFT JOIN users u ON u.id = ta.user_id
@@ -529,26 +600,38 @@ def add_task(
     estimated_hours: Optional[float] = None,
     tags: Optional[list[str]] = None,
     area: str = AREA_DEFAULT,
+    kind: str = KIND_TASK,
 ) -> Optional[int]:
-    """Crea una tarea. Retorna el task_id o None si falta el título."""
+    """Crea una tarea o evento. Retorna el task_id o None si falta el título."""
     title = (title or "").strip()
     if not title:
         return None
     if area not in AREAS:
         area = AREA_DEFAULT
+    if kind not in (KIND_TASK, KIND_EVENT):
+        kind = KIND_TASK
 
     tags_str = ",".join(t.strip() for t in (tags or []) if t.strip()) or None
 
+    insert_sql = (
+        "INSERT INTO tasks"
+        "(title, description, status, priority, due_date, deleted_at, "
+        " updated_at, estimated_hours, tags, closed_at, area, kind) "
+        "VALUES (?, ?, 'todo', ?, ?, NULL, datetime('now'), ?, ?, NULL, ?, ?)"
+    )
+    insert_params = (
+        title, (description or "").strip() or None, priority, due_date,
+        estimated_hours, tags_str, area, kind,
+    )
+
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO tasks"
-            "(title, description, status, priority, due_date, deleted_at, "
-            " updated_at, estimated_hours, tags, closed_at, area) "
-            "VALUES (?, ?, 'todo', ?, ?, NULL, datetime('now'), ?, ?, NULL, ?)",
-            (title, (description or "").strip() or None, priority, due_date, estimated_hours, tags_str, area),
-        )
-        task_id = cur.lastrowid
+        if USE_PG:
+            row = cur.execute(insert_sql + " RETURNING id", insert_params).fetchone()
+            task_id = row["id"]
+        else:
+            cur.execute(insert_sql, insert_params)
+            task_id = cur.lastrowid
         for uid in assignee_ids:
             cur.execute(
                 "INSERT OR IGNORE INTO task_assignees(task_id, user_id) VALUES (?, ?)",
@@ -569,11 +652,17 @@ def update_task(
     estimated_hours: Optional[float] = None,
     tags: Optional[list[str]] = None,
     area: str = AREA_DEFAULT,
+    kind: str = KIND_TASK,
 ) -> None:
-    """Actualiza una tarea existente."""
+    """Actualiza una tarea o evento existente."""
     tags_str = ",".join(t.strip() for t in (tags or []) if t.strip()) or None
     if area not in AREAS:
         area = AREA_DEFAULT
+    if kind not in (KIND_TASK, KIND_EVENT):
+        kind = KIND_TASK
+    if kind == KIND_EVENT:
+        # Los eventos no tienen flujo de estados
+        status = STATUS_TODO
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -582,7 +671,7 @@ def update_task(
         if status == STATUS_DONE:
             cur.execute(
                 "UPDATE tasks SET title=?, description=?, status=?, priority=?, due_date=?, "
-                "updated_at=datetime('now'), estimated_hours=?, tags=?, area=?, "
+                "updated_at=datetime('now'), estimated_hours=?, tags=?, area=?, kind=?, "
                 "closed_at=COALESCE(closed_at, datetime('now')) "
                 "WHERE id=? AND deleted_at IS NULL",
                 (
@@ -594,13 +683,14 @@ def update_task(
                     estimated_hours,
                     tags_str,
                     area,
+                    kind,
                     task_id,
                 ),
             )
         else:
             cur.execute(
                 "UPDATE tasks SET title=?, description=?, status=?, priority=?, due_date=?, "
-                "updated_at=datetime('now'), estimated_hours=?, tags=?, area=?, closed_at=NULL "
+                "updated_at=datetime('now'), estimated_hours=?, tags=?, area=?, kind=?, closed_at=NULL "
                 "WHERE id=? AND deleted_at IS NULL",
                 (
                     (title or "").strip(),
@@ -611,6 +701,7 @@ def update_task(
                     estimated_hours,
                     tags_str,
                     area,
+                    kind,
                     task_id,
                 ),
             )
@@ -734,6 +825,7 @@ def get_stats(
                 "SELECT COUNT(*) as cnt FROM tasks t "
                 "JOIN task_assignees ta ON ta.task_id=t.id AND ta.user_id=? "
                 "WHERE t.deleted_at IS NULL AND t.status != 'done' "
+                "AND COALESCE(t.kind, 'task') = 'task' "
                 "AND t.due_date IS NOT NULL AND date(t.due_date) < date('now')",
                 (user_id,),
             ).fetchone()["cnt"]
@@ -745,6 +837,7 @@ def get_stats(
             overdue = conn.execute(
                 "SELECT COUNT(*) as cnt FROM tasks "
                 "WHERE deleted_at IS NULL AND status != 'done' "
+                "AND COALESCE(kind, 'task') = 'task' "
                 "AND due_date IS NOT NULL AND date(due_date) < date('now')"
             ).fetchone()["cnt"]
     return rows, overdue
@@ -754,9 +847,6 @@ def get_stats(
 #  STREAMLIT APP
 # ═════════════════════════════════════════════
 st.set_page_config(page_title=f"{BAND_NAME} · {APP_NAME}", layout="wide", page_icon="🎸")
-
-init_db_and_migrate()
-
 
 def ensure_bootstrap_admin() -> None:
     """Si la BD está vacía (despliegue nuevo), crea el primer admin desde
@@ -775,7 +865,16 @@ def ensure_bootstrap_admin() -> None:
         add_user(name, None, password=password, is_admin=True, username=username)
 
 
-ensure_bootstrap_admin()
+@st.cache_resource
+def _init_once() -> bool:
+    """Migraciones y admin inicial: una sola vez por proceso del servidor
+    (evita ALTER TABLE y bloqueos en Postgres en cada rerun)."""
+    init_db_and_migrate()
+    ensure_bootstrap_admin()
+    return True
+
+
+_init_once()
 
 # Session state defaults
 _SESSION_DEFAULTS: dict[str, Any] = {
@@ -1133,39 +1232,53 @@ h1 {{
   font-size: 13px; font-weight: 900;
 }}
 
-/* SEGMENTED PILLS (sección y vista) */
+/* SEGMENTED PILLS (sección, vista y tipo tarea/evento) */
 .st-key-seg_seccion [role="radiogroup"],
-.st-key-seg_vista [role="radiogroup"] {{
+.st-key-seg_vista [role="radiogroup"],
+.st-key-create_kind [role="radiogroup"],
+[class*="st-key-edit_kind_"] [role="radiogroup"] {{
   display: inline-flex; gap: 4px;
   background: {PANEL_BG};
   border: 1px solid {CARD_BORDER};
   border-radius: 12px; padding: 4px;
 }}
 .st-key-seg_seccion label[data-baseweb="radio"],
-.st-key-seg_vista label[data-baseweb="radio"] {{
+.st-key-seg_vista label[data-baseweb="radio"],
+.st-key-create_kind label[data-baseweb="radio"],
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"] {{
   padding: 7px 18px; border-radius: 9px; margin: 0 !important;
   cursor: pointer; transition: background .15s, box-shadow .15s;
 }}
 .st-key-seg_seccion label[data-baseweb="radio"] > div:first-child,
-.st-key-seg_vista label[data-baseweb="radio"] > div:first-child {{
+.st-key-seg_vista label[data-baseweb="radio"] > div:first-child,
+.st-key-create_kind label[data-baseweb="radio"] > div:first-child,
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"] > div:first-child {{
   display: none;
 }}
 .st-key-seg_seccion label[data-baseweb="radio"] p,
-.st-key-seg_vista label[data-baseweb="radio"] p {{
+.st-key-seg_vista label[data-baseweb="radio"] p,
+.st-key-create_kind label[data-baseweb="radio"] p,
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"] p {{
   font-size: 13px !important; font-weight: 700 !important;
   color: {TEXT_SECONDARY};
 }}
 .st-key-seg_seccion label[data-baseweb="radio"]:hover p,
-.st-key-seg_vista label[data-baseweb="radio"]:hover p {{
+.st-key-seg_vista label[data-baseweb="radio"]:hover p,
+.st-key-create_kind label[data-baseweb="radio"]:hover p,
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"]:hover p {{
   color: {BRAND};
 }}
 .st-key-seg_seccion label[data-baseweb="radio"]:has(input:checked),
-.st-key-seg_vista label[data-baseweb="radio"]:has(input:checked) {{
+.st-key-seg_vista label[data-baseweb="radio"]:has(input:checked),
+.st-key-create_kind label[data-baseweb="radio"]:has(input:checked),
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"]:has(input:checked) {{
   background: linear-gradient(135deg, {BRAND}, {BRAND_DARK});
   box-shadow: 0 2px 8px rgba(139,92,246,.35);
 }}
 .st-key-seg_seccion label[data-baseweb="radio"]:has(input:checked) p,
-.st-key-seg_vista label[data-baseweb="radio"]:has(input:checked) p {{
+.st-key-seg_vista label[data-baseweb="radio"]:has(input:checked) p,
+.st-key-create_kind label[data-baseweb="radio"]:has(input:checked) p,
+[class*="st-key-edit_kind_"] label[data-baseweb="radio"]:has(input:checked) p {{
   color: #fff !important;
 }}
 @media (max-width: 640px) {{
@@ -1227,6 +1340,7 @@ h1 {{
 .accent-todo {{ background: linear-gradient(180deg, #f59e0b, #d97706) }}
 .accent-doing {{ background: linear-gradient(180deg, #3b82f6, #2563eb) }}
 .accent-done {{ background: linear-gradient(180deg, #22c55e, #16a34a) }}
+.accent-event {{ background: linear-gradient(180deg, #8b5cf6, #6d28d9) }}
 
 [data-testid="stVerticalBlockBorderWrapper"] > div,
 [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .tc-beacon) {{
@@ -1247,6 +1361,7 @@ h1 {{
 [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .tc-beacon[data-s="doing"])   {{ background: #eef3fe !important; border-color: #b8cef7 !important }}
 [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .tc-beacon[data-s="done"])    {{ background: #edfaf3 !important; border-color: #a5dfc0 !important }}
 [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .tc-beacon[data-s="deleted"]) {{ background: #f9f9f9 !important; border-color: #e2e2e2 !important }}
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .tc-beacon[data-s="event"])   {{ background: #f7f4ff !important; border-color: #d9caf8 !important }}
 
 /* PRIORITY PILLS */
 .prio-pill {{
@@ -1278,6 +1393,15 @@ h1 {{
   font-size: 11px; font-weight: 700; letter-spacing: .02em;
   background: rgba(139,92,246,.10); color: {BRAND_DARK};
   border: 1px solid rgba(139,92,246,.30);
+}}
+
+/* EVENT CHIP */
+.event-chip {{
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 800; letter-spacing: .02em;
+  background: linear-gradient(135deg, {BRAND}, {BRAND_DARK});
+  color: #fff;
 }}
 
 /* Título de tarjeta con jerarquía clara */
@@ -1414,6 +1538,7 @@ h1 {{
 .px-todo  {{ background: #fff7ed; color: #9a3412; border-left: 3px solid #f59e0b }}
 .px-doing {{ background: #eff6ff; color: #1e40af; border-left: 3px solid #3b82f6 }}
 .px-done  {{ background: #f0fdf4; color: #166534; border-left: 3px solid #22c55e; opacity: .7 }}
+.px-event {{ background: #f3efff; color: #5b21b6; border-left: 3px solid #8b5cf6; font-weight: 800 }}
 .calx-more {{
   font-size: 11px; font-weight: 700; color: {TEXT_SECONDARY};
   text-align: center; margin-top: 4px;
@@ -1425,6 +1550,7 @@ h1 {{
 .dx-todo  {{ background: #f59e0b }}
 .dx-doing {{ background: #3b82f6 }}
 .dx-done  {{ background: #22c55e }}
+.dx-event {{ background: #8b5cf6 }}
 .calx-legend {{
   display: flex; gap: 18px; margin-top: 10px;
   font-size: 12px; font-weight: 700; color: {TEXT_SECONDARY};
@@ -1722,6 +1848,26 @@ def due_badge_html(due_date_str: Optional[str]) -> str:
     return f'<span class="due-badge {cls}">{label}</span>'
 
 
+def event_badge_html(due_date_str: Optional[str]) -> str:
+    """Badge de fecha para eventos (un evento pasado no está 'vencido')."""
+    if not due_date_str:
+        return '<span class="due-badge due-normal">📅 Sin fecha</span>'
+    try:
+        d = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return ""
+    delta = (d - date.today()).days
+    if delta < 0:
+        cls, label = "due-normal", f"✔ Pasado · {d.strftime('%d/%m')}"
+    elif delta == 0:
+        cls, label = "due-today", "🔥 ¡Hoy!"
+    elif delta <= 7:
+        cls, label = "due-soon", f"📅 {DIAS_ES[d.weekday()]} {d.day} · en {delta} día{'s' if delta > 1 else ''}"
+    else:
+        cls, label = "due-normal", f"📅 {d.strftime('%d/%m/%Y')}"
+    return f'<span class="due-badge {cls}">{label}</span>'
+
+
 def tags_html(tags_str: Optional[str]) -> str:
     """Genera HTML de chips de tags (con escape)."""
     if not tags_str:
@@ -1974,9 +2120,14 @@ filters = {
 }
 tasks = fetch_tasks(filters)
 
-todo_n = sum(1 for t in tasks if t["status"] == STATUS_TODO)
-doing_n = sum(1 for t in tasks if t["status"] == STATUS_DOING)
-done_n = sum(1 for t in tasks if t["status"] == STATUS_DONE)
+def _is_task(t) -> bool:
+    """Las métricas y el kanban solo cuentan tareas, no eventos."""
+    return (t["kind"] or KIND_TASK) == KIND_TASK
+
+
+todo_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_TODO)
+doing_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_DOING)
+done_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_DONE)
 _, overdue_global = get_stats(user_id=CU["id"], only_mine=MY_VIEW)
 
 
@@ -2001,7 +2152,7 @@ with header_ph:
     )
 
 if main_view == "Activas":
-    total = len(tasks)
+    total = sum(1 for t in tasks if _is_task(t))
     done_pct = int((done_n / total * 100) if total > 0 else 0)
 
     metric_icon = {"mc-total": "📊", "mc-todo": "📋", "mc-doing": "🔄", "mc-done": "✅", "mc-overdue": "⚠️"}
@@ -2164,45 +2315,79 @@ def show_edit_modal(task_id: int) -> None:
     task = dict(task)
     current_assignees = [row["id"] for row in get_task_assignees(task_id)]
 
-    st.markdown(f"### ✏️ Editar tarea — *{esc(task['title'])}*")
+    st.markdown(f"### ✏️ Editar — *{esc(task['title'])}*")
+
+    cur_kind = task.get("kind") if task.get("kind") in (KIND_TASK, KIND_EVENT) else KIND_TASK
+    new_kind = st.radio(
+        "Tipo",
+        [KIND_TASK, KIND_EVENT],
+        horizontal=True,
+        index=0 if cur_kind == KIND_TASK else 1,
+        key=f"edit_kind_{task_id}",
+        format_func=lambda k: KIND_LABEL[k],
+        label_visibility="collapsed",
+    )
+    is_event = new_kind == KIND_EVENT
+
     with st.form(f"edit_task_form_{task_id}"):
         e1, e2 = st.columns([3, 1])
         new_title = e1.text_input("Título *", value=task["title"] or "")
-        new_status = e2.selectbox(
-            "Estado",
-            list(VALID_STATUSES),
-            index=list(VALID_STATUSES).index(task["status"] or STATUS_TODO),
-            format_func=lambda x: STATUS_LABEL[x],
-        )
+        if is_event:
+            new_status = STATUS_TODO
+            e2.markdown(
+                f"<div style='padding-top:34px;font-size:13px;font-weight:700;"
+                f"color:{TEXT_SECONDARY};'>📅 Evento</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            new_status = e2.selectbox(
+                "Estado",
+                list(VALID_STATUSES),
+                index=list(VALID_STATUSES).index(task["status"] or STATUS_TODO),
+                format_func=lambda x: STATUS_LABEL[x],
+            )
         new_desc = st.text_area("Descripción", value=task["description"] or "", height=100)
 
-        f1, f2, f3, f4 = st.columns(4)
-        new_prio = f1.selectbox(
-            "Prioridad",
-            list(VALID_PRIORITIES),
-            index=list(VALID_PRIORITIES).index(task["priority"] or PRIO_MEDIUM),
-            format_func=lambda x: f"{PRIO_ICON.get(x, '')} {PRIO_LABEL.get(x, x)}",
-        )
         cur_area = task.get("area") if task.get("area") in AREAS else AREA_DEFAULT
-        new_area = f2.selectbox(
-            "Área",
-            list(AREAS.keys()),
-            index=list(AREAS.keys()).index(cur_area),
-            format_func=lambda x: AREAS[x],
-        )
         due_val = None
         if task["due_date"]:
             try:
                 due_val = datetime.strptime(task["due_date"], "%Y-%m-%d").date()
             except (ValueError, TypeError):
                 pass
-        new_due = f3.date_input("Vence", value=due_val)
-        new_est = f4.number_input(
-            "Horas estimadas",
-            min_value=0.0,
-            step=0.5,
-            value=float(task.get("estimated_hours") or 0.0),
-        )
+
+        if is_event:
+            f1, f2 = st.columns(2)
+            new_area = f1.selectbox(
+                "Área",
+                list(AREAS.keys()),
+                index=list(AREAS.keys()).index(cur_area),
+                format_func=lambda x: AREAS[x],
+            )
+            new_due = f2.date_input("Fecha", value=due_val)
+            new_prio = task["priority"] or PRIO_MEDIUM
+            new_est = 0.0
+        else:
+            f1, f2, f3, f4 = st.columns(4)
+            new_prio = f1.selectbox(
+                "Prioridad",
+                list(VALID_PRIORITIES),
+                index=list(VALID_PRIORITIES).index(task["priority"] or PRIO_MEDIUM),
+                format_func=lambda x: f"{PRIO_ICON.get(x, '')} {PRIO_LABEL.get(x, x)}",
+            )
+            new_area = f2.selectbox(
+                "Área",
+                list(AREAS.keys()),
+                index=list(AREAS.keys()).index(cur_area),
+                format_func=lambda x: AREAS[x],
+            )
+            new_due = f3.date_input("Vence", value=due_val)
+            new_est = f4.number_input(
+                "Horas estimadas",
+                min_value=0.0,
+                step=0.5,
+                value=float(task.get("estimated_hours") or 0.0),
+            )
         new_assignees = st.multiselect(
             "Asignados",
             options=[u["id"] for u in users],
@@ -2235,8 +2420,9 @@ def show_edit_modal(task_id: int) -> None:
                 estimated_hours=new_est if new_est > 0 else None,
                 tags=tags_list,
                 area=new_area,
+                kind=new_kind,
             )
-            st.toast("✅ Tarea actualizada")
+            st.toast("✅ Guardado")
             st.session_state["editing_task_id"] = None
             st.rerun()
         if cancel:
@@ -2255,6 +2441,7 @@ def task_card(
 ) -> None:
     """Renderiza una tarjeta de tarea completa con acciones."""
     t = dict(t)
+    is_event = (t.get("kind") or KIND_TASK) == KIND_EVENT
     status_ = (t["status"] or STATUS_TODO).lower()
     prio_ = (t["priority"] or PRIO_MEDIUM).lower()
     prio_class = {
@@ -2263,22 +2450,34 @@ def task_card(
         PRIO_HIGH: "prio-high",
     }.get(prio_, "prio-medium")
 
-    beacon_status = "deleted" if is_deleted_view else status_
+    if is_deleted_view:
+        beacon_status = "deleted"
+    elif is_event:
+        beacon_status = "event"
+    else:
+        beacon_status = status_
 
     with st.container(border=True):
         # Beacon para JS coloring + accent bar
         st.markdown(
             f'<span class="tc-beacon" data-s="{beacon_status}"></span>'
-            f'<div class="task-card-accent accent-{status_}"></div>',
+            f'<div class="task-card-accent accent-{"event" if is_event else status_}"></div>',
             unsafe_allow_html=True,
         )
         area_ = t.get("area") if t.get("area") in AREAS else AREA_DEFAULT
-        st.markdown(
-            f'<span class="prio-pill {prio_class}">'
-            f'{PRIO_ICON.get(prio_, "")} {PRIO_LABEL.get(prio_, prio_)}</span> '
-            f'<span class="area-chip">{AREAS[area_]}</span>',
-            unsafe_allow_html=True,
-        )
+        if is_event:
+            st.markdown(
+                f'<span class="event-chip">📅 Evento</span> '
+                f'<span class="area-chip">{AREAS[area_]}</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<span class="prio-pill {prio_class}">'
+                f'{PRIO_ICON.get(prio_, "")} {PRIO_LABEL.get(prio_, prio_)}</span> '
+                f'<span class="area-chip">{AREAS[area_]}</span>',
+                unsafe_allow_html=True,
+            )
         st.markdown(f'<div class="task-title">{esc(t["title"])}</div>', unsafe_allow_html=True)
 
         # Meta info
@@ -2296,9 +2495,14 @@ def task_card(
         if t.get("deleted_at"):
             meta_parts.append(f"🗑 Borrada: {esc(t['deleted_at'][:10])}")
 
+        badge = (
+            event_badge_html(t.get("due_date"))
+            if is_event
+            else due_badge_html(t.get("due_date"))
+        )
         st.markdown(
             f"""<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;">
-              {due_badge_html(t.get('due_date'))}{tags_html(t.get('tags'))}
+              {badge}{tags_html(t.get('tags'))}
             </div>
             <div style="font-size:13px;color:{TEXT_SECONDARY};margin-bottom:8px;">
               {" · ".join(meta_parts)}
@@ -2344,14 +2548,16 @@ def task_card(
 
         # --- Modo activo (con botones de estado) ---
         if not is_deleted_view:
-            r1 = st.columns(3)
+            # Los eventos no tienen flujo de estados
+            r1 = [] if is_event else st.columns(3)
             r2 = st.columns(3)
 
-            for col_idx, (status_key, status_label, wrap_cls) in enumerate([
+            estados = [] if is_event else [
                 (STATUS_TODO, "📋 To do", "btnwrap-todo"),
                 (STATUS_DOING, "🔄 Doing", "btnwrap-doing"),
                 (STATUS_DONE, "✅ Done", "btnwrap-done"),
-            ]):
+            ]
+            for col_idx, (status_key, status_label, wrap_cls) in enumerate(estados):
                 with r1[col_idx]:
                     st.markdown(f'<div class="{wrap_cls}">', unsafe_allow_html=True)
                     if st.button(
@@ -2512,13 +2718,14 @@ def calendar_view(tasks_: list) -> None:
                     pills = ""
                     for t in day_tasks[:MAX_SHOW]:
                         stt = (t["status"] or STATUS_TODO).lower()
+                        is_ev = (t["kind"] or KIND_TASK) == KIND_EVENT
+                        pill_cls = "event" if is_ev else stt
                         area_ = t["area"] if t["area"] in AREAS else AREA_DEFAULT
                         icon = AREAS[area_].split()[0]
-                        full = esc(
-                            f"{t['title']} · {AREAS[area_]} · {STATUS_LABEL.get(stt, stt)}"
-                        )
+                        estado_lbl = "Evento" if is_ev else STATUS_LABEL.get(stt, stt)
+                        full = esc(f"{t['title']} · {AREAS[area_]} · {estado_lbl}")
                         pills += (
-                            f'<div class="calx-pill px-{stt}" title="{full}">'
+                            f'<div class="calx-pill px-{pill_cls}" title="{full}">'
                             f"{icon} {esc(t['title'])}</div>"
                         )
                     if len(day_tasks) > MAX_SHOW:
@@ -2527,7 +2734,11 @@ def calendar_view(tasks_: list) -> None:
                         )
 
                     dots = "".join(
-                        f'<span class="dotx dx-{(t["status"] or STATUS_TODO).lower()}"></span>'
+                        '<span class="dotx dx-{}"></span>'.format(
+                            "event"
+                            if (t["kind"] or KIND_TASK) == KIND_EVENT
+                            else (t["status"] or STATUS_TODO).lower()
+                        )
                         for t in day_tasks[:4]
                     )
                     dots_html = f'<div class="calx-dots">{dots}</div>' if dots else ""
@@ -2544,6 +2755,7 @@ def calendar_view(tasks_: list) -> None:
         f'<span><span class="dotx dx-todo"></span> To do</span>'
         f'<span><span class="dotx dx-doing"></span> Doing</span>'
         f'<span><span class="dotx dx-done"></span> Done</span>'
+        f'<span><span class="dotx dx-event"></span> Evento</span>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -2618,9 +2830,15 @@ def agenda_view(tasks_: list) -> None:
         )
         return
 
+    def _overdue_pending(t) -> bool:
+        # Un evento pasado no está "vencido"; solo cuentan las tareas sin cerrar
+        return (
+            (t["status"] or "") != STATUS_DONE
+            and (t["kind"] or KIND_TASK) == KIND_TASK
+        )
+
     pending_overdue = [
-        d for d in overdue_days
-        if any((t["status"] or "") != STATUS_DONE for t in by_day[d])
+        d for d in overdue_days if any(_overdue_pending(t) for t in by_day[d])
     ]
     if pending_overdue:
         st.markdown(
@@ -2630,7 +2848,7 @@ def agenda_view(tasks_: list) -> None:
         for d in pending_overdue:
             day_header(d, color="color:#b91c1c;")
             for t in by_day[d]:
-                if (t["status"] or "") != STATUS_DONE:
+                if _overdue_pending(t):
                     task_card(t, compact=True)
 
     if upcoming_days:
@@ -2657,13 +2875,45 @@ def agenda_view(tasks_: list) -> None:
 #  Nueva tarea (solo Activas)
 # ─────────────────────────────────────────────
 def show_create_form() -> None:
-    """Formulario de nueva tarea, mostrado en ventana modal."""
-    with st.container():
-        with st.form("create_task_form", clear_on_submit=True):
-            r1c1, r1c2 = st.columns([3, 1])
-            title_new = r1c1.text_input(
-                "Título *", placeholder="Ej. Reservar sala de ensayo para el sábado"
+    """Formulario de nueva tarea o evento, mostrado en ventana modal."""
+    kind_new = st.radio(
+        "Tipo",
+        [KIND_TASK, KIND_EVENT],
+        horizontal=True,
+        key="create_kind",
+        format_func=lambda k: KIND_LABEL[k],
+        label_visibility="collapsed",
+    )
+    is_event = kind_new == KIND_EVENT
+
+    with st.form("create_task_form", clear_on_submit=True):
+        r1c1, r1c2 = st.columns([3, 1])
+        title_new = r1c1.text_input(
+            "Título *",
+            placeholder=(
+                "Ej. Bolo en Sala Apolo"
+                if is_event
+                else "Ej. Reservar sala de ensayo para el sábado"
+            ),
+        )
+        if is_event:
+            area_new = r1c2.selectbox(
+                "Área",
+                list(AREAS.keys()),
+                index=list(AREAS.keys()).index("bolo"),
+                format_func=lambda x: AREAS[x],
             )
+            desc_new = st.text_area(
+                "Descripción",
+                height=80,
+                placeholder="Detalles del evento: sitio, hora, backline…",
+            )
+            r2c1, r2c2 = st.columns(2)
+            due_new = r2c1.date_input("Fecha *", value=None)
+            tags_new = r2c2.text_input("Tags", placeholder="gira2026")
+            prio_new = PRIO_MEDIUM
+            est_new = 0.0
+        else:
             prio_new = r1c2.selectbox(
                 "Prioridad",
                 list(VALID_PRIORITIES),
@@ -2673,7 +2923,6 @@ def show_create_form() -> None:
             desc_new = st.text_area(
                 "Descripción", height=80, placeholder="Detalla el contexto de la tarea…"
             )
-
             r2c1, r2c2, r2c3, r2c4 = st.columns(4)
             area_new = r2c1.selectbox(
                 "Área",
@@ -2687,31 +2936,35 @@ def show_create_form() -> None:
             )
             tags_new = r2c4.text_input("Tags", placeholder="gira2026, urgente")
 
-            default_assignees = (
-                [CU["id"]] if CU["id"] in [u["id"] for u in users] else []
-            )
-            assignees_new = st.multiselect(
-                "Asignar a",
-                options=[u["id"] for u in users],
-                default=default_assignees,
-                format_func=lambda uid: name_by_id.get(uid, str(uid)),
-            )
+        default_assignees = (
+            [CU["id"]] if CU["id"] in [u["id"] for u in users] else []
+        )
+        assignees_new = st.multiselect(
+            "Asignar a" if not is_event else "Quiénes van",
+            options=[u["id"] for u in users],
+            default=default_assignees,
+            format_func=lambda uid: name_by_id.get(uid, str(uid)),
+        )
 
-            cbtns = st.columns(2)
-            crear = cbtns[0].form_submit_button(
-                "🚀 Crear tarea",
-                type="primary",
-                use_container_width=True,
-                disabled=st.session_state["busy_create_task"],
-            )
-            cancelar = cbtns[1].form_submit_button("✕ Cancelar", use_container_width=True)
-            if cancelar:
-                st.session_state["show_nueva_tarea"] = False
-                st.rerun()
-            if crear:
-                st.session_state["busy_create_task"] = True
-                due_str = due_new.isoformat() if isinstance(due_new, date) else None
-                tags_list = [t.strip() for t in (tags_new or "").split(",") if t.strip()]
+        cbtns = st.columns(2)
+        crear = cbtns[0].form_submit_button(
+            "🚀 Crear evento" if is_event else "🚀 Crear tarea",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state["busy_create_task"],
+        )
+        cancelar = cbtns[1].form_submit_button("✕ Cancelar", use_container_width=True)
+        if cancelar:
+            st.session_state["show_nueva_tarea"] = False
+            st.rerun()
+        if crear:
+            st.session_state["busy_create_task"] = True
+            due_str = due_new.isoformat() if isinstance(due_new, date) else None
+            tags_list = [t.strip() for t in (tags_new or "").split(",") if t.strip()]
+            if is_event and not due_str:
+                st.session_state["busy_create_task"] = False
+                st.warning("⚠️ Un evento necesita fecha.")
+            else:
                 task_id = add_task(
                     title_new,
                     desc_new,
@@ -2721,15 +2974,16 @@ def show_create_form() -> None:
                     estimated_hours=est_new if est_new > 0 else None,
                     tags=tags_list,
                     area=area_new,
+                    kind=kind_new,
                 )
                 if task_id:
-                    st.toast("✅ Tarea creada")
+                    st.toast("✅ Evento creado" if is_event else "✅ Tarea creada")
                     st.session_state["busy_create_task"] = False
                     st.session_state["show_nueva_tarea"] = False
                     st.rerun()
                 else:
                     st.session_state["busy_create_task"] = False
-                    st.warning("⚠️ Pon un título para crear la tarea.")
+                    st.warning("⚠️ Pon un título para crear.")
 
 
 if main_view == "Activas":
@@ -2829,9 +3083,38 @@ with board_panel:
         elif view_mode == "Agenda":
             agenda_view(tasks)
         else:
-            # Vista Kanban
+            # Franja de próximos eventos (bolos, ensayos…)
+            eventos = [t for t in tasks if (t["kind"] or KIND_TASK) == KIND_EVENT]
+            if eventos:
+                hoy_iso = date.today().isoformat()
+                proximos = sorted(
+                    [t for t in eventos if not t["due_date"] or t["due_date"] >= hoy_iso],
+                    key=lambda t: t["due_date"] or "9999-12-31",
+                )
+                pasados = [t for t in eventos if t["due_date"] and t["due_date"] < hoy_iso]
+
+                st.markdown(
+                    '<div class="agenda-section">📅 Próximos eventos</div>',
+                    unsafe_allow_html=True,
+                )
+                if proximos:
+                    ev_cols = st.columns(min(3, len(proximos)), gap="medium")
+                    for i, ev in enumerate(proximos[:6]):
+                        with ev_cols[i % len(ev_cols)]:
+                            task_card(ev, compact=True)
+                else:
+                    st.caption("No hay eventos próximos — ¡a mover bolos! 🎸")
+                if pasados:
+                    with st.expander(f"Eventos pasados ({len(pasados)})"):
+                        for ev in pasados:
+                            task_card(ev, compact=True)
+                st.markdown("")
+
+            # Vista Kanban (solo tareas)
             tasks_by_status: dict[str, list] = {STATUS_TODO: [], STATUS_DOING: []}
             for t in tasks:
+                if (t["kind"] or KIND_TASK) == KIND_EVENT:
+                    continue
                 stt = (t["status"] or STATUS_TODO).lower()
                 if stt in (STATUS_TODO, STATUS_DOING):
                     tasks_by_status[stt].append(t)
