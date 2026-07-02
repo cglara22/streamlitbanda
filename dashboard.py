@@ -573,6 +573,18 @@ def get_all_tags() -> list[str]:
     return sorted(tags)
 
 
+# Cachés de lectura: evitan repetir consultas casi estáticas en cada rerun
+# (contra Supabase cada consulta cuesta un viaje de red)
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_users_cached() -> list[dict]:
+    return [dict(u) for u in fetch_users()]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_all_tags_cached() -> list[str]:
+    return get_all_tags()
+
+
 def add_user(
     name: str,
     email: str,
@@ -606,6 +618,7 @@ def add_user(
                 )
                 conn.commit()
 
+            fetch_users_cached.clear()
             return True, unique_username
         except Exception as e:
             return False, str(e)
@@ -658,6 +671,7 @@ def add_task(
                 (task_id, uid),
             )
         conn.commit()
+    get_all_tags_cached.clear()
     return task_id
 
 
@@ -733,6 +747,7 @@ def update_task(
                 (task_id, uid),
             )
         conn.commit()
+    get_all_tags_cached.clear()
 
 
 def get_task_by_id(task_id: int) -> Optional[sqlite3.Row]:
@@ -829,19 +844,11 @@ def delete_task_note(note_id: int) -> None:
         conn.commit()
 
 
-def get_stats(
-    user_id: Optional[int] = None, only_mine: bool = False
-) -> tuple[list[sqlite3.Row], int]:
-    """Retorna estadísticas (filas status×priority, nº vencidas)."""
+def get_overdue_count(user_id: Optional[int] = None, only_mine: bool = False) -> int:
+    """Nº de tareas vencidas (los eventos pasados no cuentan)."""
     with get_conn() as conn:
         if only_mine and user_id:
-            rows = conn.execute(
-                "SELECT t.status, t.priority, COUNT(*) as cnt FROM tasks t "
-                "JOIN task_assignees ta ON ta.task_id=t.id AND ta.user_id=? "
-                "WHERE t.deleted_at IS NULL GROUP BY t.status, t.priority",
-                (user_id,),
-            ).fetchall()
-            overdue = conn.execute(
+            return conn.execute(
                 "SELECT COUNT(*) as cnt FROM tasks t "
                 "JOIN task_assignees ta ON ta.task_id=t.id AND ta.user_id=? "
                 "WHERE t.deleted_at IS NULL AND t.status != 'done' "
@@ -849,18 +856,12 @@ def get_stats(
                 "AND t.due_date IS NOT NULL AND date(t.due_date) < date('now')",
                 (user_id,),
             ).fetchone()["cnt"]
-        else:
-            rows = conn.execute(
-                "SELECT status, priority, COUNT(*) as cnt "
-                "FROM tasks WHERE deleted_at IS NULL GROUP BY status, priority"
-            ).fetchall()
-            overdue = conn.execute(
-                "SELECT COUNT(*) as cnt FROM tasks "
-                "WHERE deleted_at IS NULL AND status != 'done' "
-                "AND COALESCE(kind, 'task') = 'task' "
-                "AND due_date IS NOT NULL AND date(due_date) < date('now')"
-            ).fetchone()["cnt"]
-    return rows, overdue
+        return conn.execute(
+            "SELECT COUNT(*) as cnt FROM tasks "
+            "WHERE deleted_at IS NULL AND status != 'done' "
+            "AND COALESCE(kind, 'task') = 'task' "
+            "AND due_date IS NOT NULL AND date(due_date) < date('now')"
+        ).fetchone()["cnt"]
 
 
 # ═════════════════════════════════════════════
@@ -1840,7 +1841,7 @@ CU: dict = st.session_state["current_user"]
 IS_ADMIN: bool = bool(CU.get("is_admin"))
 MY_VIEW: bool = st.session_state["my_view"]
 
-users = fetch_users()
+users = fetch_users_cached()
 user_by_name: dict[str, int] = {u["name"]: u["id"] for u in users}
 name_by_id: dict[int, str] = {u["id"]: u["name"] for u in users}
 
@@ -2111,7 +2112,7 @@ with board_panel, st.container(key="filterbar"):
                 unsafe_allow_html=True,
             )
 
-        all_tags = get_all_tags()
+        all_tags = get_all_tags_cached()
         tag_filter: Optional[str] = None
         if all_tags:
             tag_sel = mf4.selectbox(
@@ -2148,7 +2149,7 @@ def _is_task(t) -> bool:
 todo_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_TODO)
 doing_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_DOING)
 done_n = sum(1 for t in tasks if _is_task(t) and t["status"] == STATUS_DONE)
-_, overdue_global = get_stats(user_id=CU["id"], only_mine=MY_VIEW)
+overdue_global = get_overdue_count(user_id=CU["id"], only_mine=MY_VIEW)
 
 
 # ─────────────────────────────────────────────
