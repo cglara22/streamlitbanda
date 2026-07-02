@@ -757,6 +757,26 @@ st.set_page_config(page_title=f"{BAND_NAME} · {APP_NAME}", layout="wide", page_
 
 init_db_and_migrate()
 
+
+def ensure_bootstrap_admin() -> None:
+    """Si la BD está vacía (despliegue nuevo), crea el primer admin desde
+    st.secrets (ADMIN_NAME, ADMIN_USER, ADMIN_PASS). Sin secrets no hace nada."""
+    with get_conn() as conn:
+        n = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    if n:
+        return
+    try:
+        username = st.secrets.get("ADMIN_USER")
+        password = st.secrets.get("ADMIN_PASS")
+        name = st.secrets.get("ADMIN_NAME", "Admin")
+    except Exception:
+        return
+    if username and password:
+        add_user(name, None, password=password, is_admin=True, username=username)
+
+
+ensure_bootstrap_admin()
+
 # Session state defaults
 _SESSION_DEFAULTS: dict[str, Any] = {
     "logged_in": False,
