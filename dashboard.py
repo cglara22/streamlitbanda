@@ -124,6 +124,21 @@ if USE_PG:
     import psycopg2
     import psycopg2.extras
 
+    @st.cache_resource
+    def _shared_pg_conn():
+        """Una única conexión persistente por proceso (abrir una nueva por
+        consulta añade ~300ms de TLS+auth contra Supabase en cada operación)."""
+        conn = psycopg2.connect(DB_URL, connect_timeout=10)
+        conn.autocommit = True
+        return conn
+
+    def _get_pg_conn():
+        conn = _shared_pg_conn()
+        if conn.closed:
+            _shared_pg_conn.clear()
+            conn = _shared_pg_conn()
+        return conn
+
 
 def _pg_translate(sql: str) -> str:
     """Traduce el SQL escrito para SQLite al dialecto de Postgres."""
@@ -145,29 +160,34 @@ class _PgConn:
         self._c = conn
 
     def execute(self, sql: str, params=()):
-        cur = self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(_pg_translate(sql), params or None)
+        try:
+            cur = self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(_pg_translate(sql), params or None)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # El pooler cerró la conexión inactiva: reconectar y reintentar una vez
+            _shared_pg_conn.clear()
+            self._c = _get_pg_conn()
+            cur = self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(_pg_translate(sql), params or None)
         return cur
 
     def cursor(self) -> "_PgConn":
         return self
 
     def commit(self) -> None:
-        self._c.commit()
+        # La conexión compartida va en autocommit; esto es un no-op seguro
+        pass
 
     def close(self) -> None:
-        self._c.close()
+        pass
 
 
 @contextmanager
 def get_conn():
     """Conexión a Postgres (Supabase) si hay DB_URL en secrets; si no, SQLite local."""
     if USE_PG:
-        conn = psycopg2.connect(DB_URL)
-        try:
-            yield _PgConn(conn)
-        finally:
-            conn.close()
+        # Conexión compartida y persistente: no se cierra al salir
+        yield _PgConn(_get_pg_conn())
     else:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.row_factory = sqlite3.Row
